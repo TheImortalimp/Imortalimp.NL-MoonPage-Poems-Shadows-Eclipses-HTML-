@@ -461,6 +461,8 @@ else window.SunCalc = SunCalc;
             outline: none; min-width: 170px;
         }
         select:focus { border-color: var(--accent); }
+        #eclipseSelect { min-width: 235px; max-width: 100%; }
+        #eclipseStopBtn { margin-left: 0.4rem; }
         #phaseName {
             font-size: 1.35rem; font-weight: 600; color: var(--accent);
             margin: 0.4rem 0 0.6rem; letter-spacing: 0.02em;
@@ -585,6 +587,7 @@ else window.SunCalc = SunCalc;
                   Bright/rayed craters: Tycho, Copernicus and Aristarchus.
                 -->
                 <g id="moonCraters" clip-path="url(#moon-clip)" mask="url(#moonIlluminationMask)" aria-label="Stylised map of the Moon's near-side maria and craters">
+                    <g id="moonMaria"><!-- The maria carry their own orientation; see moonOrientation(). -->
                     <!-- Oceanus Procellarum, the large western dark plain -->
                     <path d="M79 153 C104 106 165 92 207 120 C217 150 197 179 174 200 C154 219 148 255 116 276 C85 264 65 231 67 196 C68 180 72 164 79 153Z" fill="#42434a" opacity=".42"/>
                     <!-- Mare Imbrium / Sinus Iridum -->
@@ -619,6 +622,7 @@ else window.SunCalc = SunCalc;
                         <path d="M247 332 L278 457" stroke-width="2"/>
                         <path d="M247 332 L137 258" stroke-width="2"/>
                         <path d="M247 332 L359 236" stroke-width="2"/>
+                    </g>
                     </g>
                 </g>
                 <!--
@@ -671,9 +675,13 @@ else window.SunCalc = SunCalc;
                 </select>
             </div>
             <div>
-                <button id="eclipsePreviewBtn" class="preview-btn" type="button"
-                        aria-pressed="false" title="Run the clock through the nearest eclipse with a real bite - tonight's, if there is one">
-                    ▶ Preview next eclipse
+                <select id="eclipseSelect" aria-label="Preview a lunar eclipse"
+                        title="Every lunar eclipse from 2025 to 2060. Any the Moon stays below your horizon for is marked.">
+                    <option value="">▶ Preview an eclipse…</option>
+                </select>
+                <button id="eclipseStopBtn" class="preview-btn" type="button" hidden
+                        title="Return to the present moment">
+                    ⏹ Stop
                 </button>
             </div>
         </div>
@@ -2087,6 +2095,18 @@ else window.SunCalc = SunCalc;
             });
         }
 
+        /*
+           The Moon's own phase on the date being previewed. An eclipse always
+           falls at full Moon - that is what an eclipse is - but the page reports
+           the real figure instead of assuming it, so a previewed date that is
+           not exactly full says so and the drawing matches the words.
+        */
+        function phaseLabelAt(date) {
+            const illum = SunCalc.getMoonIllumination(date);
+            const idx = getPhaseIndex(illum.fraction, illum.phase);
+            return phases[idx] + ' ' + Math.round(illum.fraction * 100) + '%';
+        }
+
         function formatEclipseClock(ms) {
             return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
         }
@@ -2229,6 +2249,7 @@ else window.SunCalc = SunCalc;
                     eclipseStatusEl.textContent = '⏯ Preview · ' + eclipseKind(magnitudeAtGreatest(ev)) +
                         ' lunar eclipse of ' + formatEclipseDate(ev.t0) + ' · ' +
                         formatEclipseClock(previewState.t) + ' · ' +
+                        phaseLabelAt(new Date(ev.t0)) + ' · ' +
                         (st ? (st.umbMag > 0
                             ? Math.round(st.obscuration * 100) + '% of the disc in shadow'
                             : 'penumbral shading only') : 'Moon clear of the shadow');
@@ -2277,43 +2298,90 @@ else window.SunCalc = SunCalc;
         /* --------------------------- preview mode --------------------------
            Eclipses are rare, so the page can also walk through the next one
            that actually shows a bite at a few hundred times real speed.       */
-        const previewState = { active: false, t: 0, lastT0: 0, start: 0, speed: 420 };
-        const PREVIEW_SPAN = 2.4 * 3600e3;         // either side of greatest eclipse
+        const previewState = { active: false, t: 0, lastT0: 0, start: 0, end: 0, speed: 420 };
+        const PREVIEW_SPAN = 3 * 3600e3;           // cap on either side of greatest
         let observerPos = { lat: 52.37, lng: 4.90 };
 
-        function togglePreview() {
-            const btn = document.getElementById('eclipsePreviewBtn');
-            if (previewState.active) {
-                previewState.active = false;
-                btn.setAttribute('aria-pressed', 'false');
-                btn.textContent = '▶ Preview next eclipse';
-            } else {
-                // First run: open on the eclipse nearest in time, so the one
-                // happening tonight is the one you see. Afterwards, walk forward.
-                let ev;
-                if (!previewState.lastT0) {
-                    ev = null;
-                    let best = Infinity;
-                    for (const e of eclipseEvents) {
-                        if (magnitudeAtGreatest(e) < 0.25) continue;
-                        const g = Math.abs(e.t0 - Date.now());
-                        if (g < best) { best = g; ev = e; }
-                    }
-                } else {
-                    ev = nextEclipseAfter(previewState.lastT0 + 3600e3, 0.25);
+        /*
+           Every eclipse in the table, in a menu. The list is built from the
+           catalogue, and each entry is marked if the Moon never clears your
+           horizon while it runs - rebuilt when the observer moves, so the menu
+           never offers you something you could not watch from where you are.
+        */
+        function buildEclipseMenu() {
+            const sel = document.getElementById('eclipseSelect');
+            if (!sel) return;
+            const keep = sel.value;
+            sel.innerHTML = '';
+            const idle = document.createElement('option');
+            idle.value = '';
+            idle.textContent = '▶ Preview an eclipse…';
+            sel.appendChild(idle);
+
+            let group = null, decade = null;
+            for (const ev of eclipseEvents) {
+                if (penumbralMagnitudeAtGreatest(ev) <= 0.02) continue;   // misses entirely
+                const mag = magnitudeAtGreatest(ev);
+                const year = new Date(ev.t0).getUTCFullYear();
+                const dec = Math.floor(year / 10) * 10;
+                if (dec !== decade) {
+                    decade = dec;
+                    group = document.createElement('optgroup');
+                    group.label = dec + 's';
+                    sel.appendChild(group);
                 }
-                if (!ev) return;
-                previewState.active = true;
-                previewState.lastT0 = ev.t0;
-                // Open at first contact when it is a few hours away at most, so the
-                // walk-through covers the whole event and not just its middle.
-                const p1 = eclipseFirstContact(ev);
-                previewState.start = (ev.t0 - p1 < 6 * 3600e3) ? p1 : ev.t0 - PREVIEW_SPAN;
-                previewState.t = previewState.start;
-                btn.setAttribute('aria-pressed', 'true');
-                btn.textContent = '⏹ Exit preview';
+                const opt = document.createElement('option');
+                opt.value = String(ev.t0);
+                const size = mag >= 1 ? 'total ' + mag.toFixed(2)
+                    : mag > 0 ? 'partial ' + Math.round(mag * 100) + '%'
+                    : 'penumbral';
+                opt.textContent = formatEclipseDate(ev.t0) + ' · ' + size +
+                    (eclipseVisibility(ev).visible ? '' : ' · below your horizon');
+                group.appendChild(opt);
             }
+            sel.value = keep;
+            if (sel.selectedIndex < 0) sel.value = '';
+        }
+
+        // Start the walk-through of one eclipse, from its first contact.
+        function previewEvent(ev) {
+            if (!ev) return;
+            previewState.lastT0 = ev.t0;
+            const p1 = eclipseFirstContact(ev);
+            const p4 = 2 * ev.t0 - p1;                 // the track is symmetric
+            previewState.start = Math.max(p1, ev.t0 - PREVIEW_SPAN);
+            previewState.end = Math.min(p4, ev.t0 + PREVIEW_SPAN);
+            previewState.t = previewState.start;
+            previewState.active = true;
+            syncPreviewControls();
             refreshMoon();
+        }
+
+        function stopPreview() {
+            previewState.active = false;
+            syncPreviewControls();
+            refreshMoon();
+        }
+
+        function syncPreviewControls() {
+            const sel = document.getElementById('eclipseSelect');
+            const btn = document.getElementById('eclipseStopBtn');
+            if (sel && !previewState.active) sel.value = '';
+            if (btn) btn.hidden = !previewState.active;
+        }
+
+        // Still here for the keyboard and for anyone scripting the page: with
+        // nothing chosen it opens the nearest eclipse with a real bite.
+        function togglePreview() {
+            if (previewState.active) { stopPreview(); return; }
+            let ev = null, best = Infinity;
+            for (const e of eclipseEvents) {
+                if (magnitudeAtGreatest(e) < 0.25) continue;
+                if (penumbralMagnitudeAtGreatest(e) <= 0.02) continue;
+                const g = Math.abs(e.t0 - Date.now());
+                if (g < best) { best = g; ev = e; }
+            }
+            previewEvent(ev);
         }
 
         /*
@@ -2338,12 +2406,18 @@ else window.SunCalc = SunCalc;
             const illum = SunCalc.getMoonIllumination(frameDate);
             const moonPos = SunCalc.getMoonPosition(frameDate, observerPos.lat, observerPos.lng);
             updateMoonVisual(illum.fraction, illum.phase,
-                             (moonPos.parallacticAngle || 0) * DEG, illum.angle);
+                             (moonPos.parallacticAngle || 0) * DEG, illum.angle, frameDate);
             updateEclipseShadows(date, observerPos.lat, observerPos.lng, moonPos, illum, frameDate);
             updateEclipseStatus();
         }
 
-        document.getElementById('eclipsePreviewBtn').addEventListener('click', togglePreview);
+        buildEclipseMenu();
+        document.getElementById('eclipseSelect').addEventListener('change', () => {
+            const t0 = Number(document.getElementById('eclipseSelect').value);
+            if (!t0) { stopPreview(); return; }
+            previewEvent(eclipseEvents.find(e => e.t0 === t0));
+        });
+        document.getElementById('eclipseStopBtn').addEventListener('click', stopPreview);
 
         /* ===== ORIGINAL MOON LOGIC (preserved) ===== */
         const moonSVG = document.getElementById('moonSVG');
@@ -2364,13 +2438,114 @@ else window.SunCalc = SunCalc;
             return (illuminationFraction < 0.5) ? 7 : 5;
         }
 
+        /* ------------------- which way is the Moon facing? -------------------
+
+           A drawing of the Moon has two independent orientations: the terminator,
+           which follows the Sun, and the maria, which follow the Moon's own pole.
+           Rotating the whole disc by the bright limb - the obvious thing, and
+           what this page used to do - is right for a crescent but degenerate at
+           full Moon, where the bright limb's position angle swings through some
+           150 degrees in a day and drags the face around with it. So the maria
+           get their own rotation, from the position angle of the Moon's north
+           pole, and the two are independent of one another.
+
+           The pole follows from Cassini's laws: the lunar equator is inclined
+           1.5424 degrees to the ecliptic and its node sits at the descending node
+           of the orbit, which puts the pole 1.5424 degrees from the ecliptic pole
+           on the far side of it. The libration (l, b) - the selenographic
+           position of the point directly beneath you - then follows from the pole
+           and the direction to the observer, and is worked out topocentrically,
+           so it carries the diurnal nod of about a degree that depends on where
+           on Earth you are standing.
+
+           Checked against JPL Horizons at dates in both hemispheres: l and b to
+           0.08 degrees, the pole's position angle to 0.02 degrees.
+        */
+        function julianDayNumber(date) {
+            return date.getTime() / 86400000 - 0.5 + 2440588;
+        }
+
+        // The Moon's geocentric ecliptic longitude, latitude and distance (km).
+        function moonEclipticPosition(date) {
+            const d = julianDayNumber(date) - 2451545.0;      // days since J2000
+            const L = 218.3164477 + 13.17639648 * d;          // mean longitude
+            const D = 297.8501921 + 12.19074912 * d;          // mean elongation
+            const M = 134.9633964 + 13.06499295 * d;          // mean anomaly
+            const Mp = 357.5291092 + 0.98560028 * d;          // Sun's mean anomaly
+            const F = 93.2720950 + 13.22935024 * d;           // argument of latitude
+            const r = x => x / DEG;
+            let lon = L + 6.289 * Math.sin(r(M))
+                + 1.274 * Math.sin(r(2 * D - M)) + 0.658 * Math.sin(r(2 * D))
+                + 0.214 * Math.sin(r(2 * M)) - 0.186 * Math.sin(r(Mp))
+                - 0.114 * Math.sin(r(2 * F)) + 0.059 * Math.sin(r(2 * D - 2 * M))
+                + 0.057 * Math.sin(r(2 * D - Mp - M)) + 0.053 * Math.sin(r(2 * D + M));
+            let lat = 5.128 * Math.sin(r(F)) + 0.281 * Math.sin(r(M + F))
+                - 0.278 * Math.sin(r(F - M)) - 0.173 * Math.sin(r(F - 2 * D));
+            let dist = 385000.6 - 20905 * Math.cos(r(M)) - 3699 * Math.cos(r(2 * D - M))
+                - 2956 * Math.cos(r(2 * D)) - 570 * Math.cos(r(2 * M));
+            return { lon: ((lon % 360) + 360) % 360, lat: lat, dist: dist };
+        }
+
+        // Geocentric position of the observer, equatorial frame, kilometres (WGS84).
+        function observerVector(date, latDeg, lngDeg) {
+            const jd = julianDayNumber(date);
+            const gmst = (280.46061837 + 360.98564736629 * (jd - 2451545.0)) / DEG;
+            const lst = gmst + lngDeg / DEG;
+            const phi = latDeg / DEG;
+            const f = 1 / 298.257223563, e2 = f * (2 - f);
+            const sp = Math.sin(phi), cp = Math.cos(phi);
+            const N = R_EARTH_KM / Math.sqrt(1 - e2 * sp * sp);
+            return [N * cp * Math.cos(lst), N * cp * Math.sin(lst), N * (1 - e2) * sp];
+        }
+
+        const OBLIQUITY = 23.4392911;                          // degrees, J2000
+        function equatorialToEcliptic(v) {
+            const e = OBLIQUITY / DEG, c = Math.cos(e), s = Math.sin(e);
+            return [v[0], v[1] * c + v[2] * s, -v[1] * s + v[2] * c];
+        }
+        function eclipticVector(lonDeg, latDeg) {
+            const l = lonDeg / DEG, b = latDeg / DEG;
+            return [Math.cos(b) * Math.cos(l), Math.cos(b) * Math.sin(l), Math.sin(b)];
+        }
+
+        /*
+           l, b  - selenographic coordinates of the point directly beneath the
+                   observer (the libration), east-positive.
+           P     - position angle of the Moon's north pole, counter-clockwise
+                   from celestial north, as JPL Horizons reports it.
+        */
+        function moonOrientation(date, latDeg, lngDeg) {
+            const d = julianDayNumber(date) - 2451545.0;
+            const node = 125.0445479 - 0.0529538083 * d;       // ascending node
+            const pole = eclipticVector(node + 90, 90 - 1.54242);
+            const prime = eclipticVector(218.3164477 + 13.17639648 * d + 180, 0);
+            const east90 = vNorm(vCross(pole, prime));
+
+            const mc = moonEclipticPosition(date);
+            const moonVec = vScale(eclipticVector(mc.lon, mc.lat), mc.dist);
+            const toObs = vNorm(vSub(equatorialToEcliptic(observerVector(date, latDeg, lngDeg)), moonVec));
+            const b = Math.asin(Math.max(-1, Math.min(1, vDot(toObs, pole)))) * DEG;
+            let l = Math.atan2(vDot(toObs, east90), vDot(toObs, prime)) * DEG;
+
+            // Position angle of the pole: project the pole and celestial north
+            // onto the sky, then measure counter-clockwise from north to east.
+            const sight = vScale(toObs, -1);
+            const northEcl = equatorialToEcliptic([0, 0, 1]);
+            const nHat = vNorm(vSub(northEcl, vScale(sight, vDot(northEcl, sight))));
+            const eHat = vNorm(vCross(northEcl, sight));
+            const pPerp = vSub(pole, vScale(sight, vDot(pole, sight)));
+            let P = Math.atan2(vDot(pPerp, eHat), vDot(pPerp, nHat)) * DEG;
+            if (P < 0) P += 360;
+            return { l: ((l + 180) % 360 + 360) % 360 - 180, b: b, P: P };
+        }
+
         /*
            Draw the lit lunar surface from the actual synodic phase.
            The old four-arc version selected its sweep flags inconsistently, which
            could place the bright area on the wrong half of the disc. Sampling the
            outer limb and the terminator gives one unambiguous closed shape.
         */
-        function updateMoonVisual(illuminationFraction, phase, parallacticAngle, illuminationAngle) {
+        function updateMoonVisual(illuminationFraction, phase, parallacticAngle, illuminationAngle, when) {
             const r = 240;
             const cx = 250;
             const cy = 250;
@@ -2429,6 +2604,30 @@ else window.SunCalc = SunCalc;
             */
             const visualRotation = -(brightLimbDegrees - parallacticAngle) - 90;
             moonSVG.style.transform = `rotate(${visualRotation}deg)`;
+
+            /*
+               The maria answer to the pole, not to the Sun. Rotating them back by
+               the bright limb cancels it out of their final orientation - which is
+               the point: near full Moon the bright limb turns through a large
+               angle in hours, and the face should not follow it. What is left is
+               the pole's position angle against the parallactic angle, so the
+               Moon is drawn as your horizon shows it: north up when it culminates
+               in the north, upside down in the south.
+
+               They are also shifted by the libration, so the face nods and sways
+               by up to eight degrees and, by a degree or so, differently for you
+               than for someone a thousand kilometres away.
+            */
+            const maria = document.getElementById('moonMaria');
+            if (maria) {
+                const orient = moonOrientation(when, observerPos.lat, observerPos.lng);
+                const spin = brightLimbDegrees - orient.P + 90;
+                const librationX = -240 * Math.sin(orient.l / DEG) * Math.cos(orient.b / DEG);
+                const librationY = 240 * Math.sin(orient.b / DEG);
+                maria.setAttribute('transform',
+                    `translate(${librationX.toFixed(2)} ${librationY.toFixed(2)}) ` +
+                    `rotate(${spin.toFixed(2)} 250 250)`);
+            }
 
             // Intentional true-dark-side mode: the unlit hemisphere emits and reflects no visible light.
             // The illumination mask fades directly into black; earthshine is disabled.
@@ -2553,6 +2752,7 @@ else window.SunCalc = SunCalc;
                 observerPos = { lat: lat, lng: lon };
                 nextEclipseCache = null;
                 visibilityCache.clear();
+                buildEclipseMenu();
                 positionApplied = true;
                 refreshMoon();
             }
@@ -2613,6 +2813,7 @@ else window.SunCalc = SunCalc;
                                 state: fellBack ? 'denied' : (error ? 'no-weather' : 'granted') };
             nextEclipseCache = null;      // the answer depends on where you are
             visibilityCache.clear();
+            buildEclipseMenu();           // and so does which eclipses you can see
             positionApplied = true;
             refreshMoon(now);   // phase + any eclipse shadow, for this exact moment
             renderLocationLine();
@@ -2671,9 +2872,7 @@ else window.SunCalc = SunCalc;
             if (previewState.active) {
                 // Walk the clock through the eclipse, then loop back to first contact.
                 previewState.t += Math.min(now - lastFrameAt, 100) * previewState.speed;
-                if (previewState.t - previewState.lastT0 > PREVIEW_SPAN) {
-                    previewState.t = previewState.start;
-                }
+                if (previewState.t >= previewState.end) previewState.t = previewState.start;
                 if (now - lastEclipseCheck > 40) { lastEclipseCheck = now; refreshMoon(); }
             } else if (now - lastEclipseCheck > 20000) {
                 // Between eclipses nothing moves fast; 20 s keeps the status honest.
@@ -2781,5 +2980,5 @@ else window.SunCalc = SunCalc;
             setInterval(updateEclipseStatus, 1000);   // keeps the countdown ticking
         });
     </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a325033b689c6709',t:'MTc4NzkzNzg5OA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>

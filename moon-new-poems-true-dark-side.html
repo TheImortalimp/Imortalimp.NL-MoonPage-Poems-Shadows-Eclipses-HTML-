@@ -1922,8 +1922,11 @@ else window.SunCalc = SunCalc;
            as an angle inside the SVG's own drawing frame: measured from the
            drawing's +x axis (which is the direction of the Sun, i.e. the bright
            limb) turning toward +y. */
-        function eclipseShadowAngle(when, latDeg, lngDeg, st, moonPos, illum) {
+        function eclipseShadowAngle(when, latDeg, lngDeg, st, moonPos, illum, frameDate) {
             const date = when;
+            // The sky frame the answer is expressed in: now when live, held at
+            // greatest eclipse during a preview (see refreshMoon).
+            const frame = frameDate || date;
             // SunCalc's azimuth runs from south toward west; make it a compass bearing.
             const alt = moonPos.altitude, az = moonPos.azimuth + Math.PI;
             const m = [Math.cos(alt) * Math.sin(az), Math.cos(alt) * Math.cos(az), Math.sin(alt)];
@@ -1936,8 +1939,8 @@ else window.SunCalc = SunCalc;
 
             // Ecliptic frame at the Moon: it sits opposite the Sun, at latitude ~0.
             const ls = solarElements(date).lon / DEG;
-            const eastward = eclipticToHorizon([Math.sin(ls), -Math.cos(ls), 0], date, latDeg, lngDeg);
-            const northward = eclipticToHorizon([0, 0, 1], date, latDeg, lngDeg);
+            const eastward = eclipticToHorizon([Math.sin(ls), -Math.cos(ls), 0], frame, latDeg, lngDeg);
+            const northward = eclipticToHorizon([0, 0, 1], frame, latDeg, lngDeg);
 
             // Offset of the shadow's axis from the Moon's centre, in degrees.
             const along = -st.rate * st.dt;                  // + when the axis lies east
@@ -1987,7 +1990,7 @@ else window.SunCalc = SunCalc;
 
         let eclipseState = null;
 
-        function updateEclipseShadows(when, latDeg, lngDeg, moonPos, illum) {
+        function updateEclipseShadows(when, latDeg, lngDeg, moonPos, illum, frameDate) {
             const st = eclipseAt(when, latDeg, lngDeg);
             eclipseState = st;
             if (!st) {
@@ -1995,7 +1998,7 @@ else window.SunCalc = SunCalc;
                 return null;
             }
 
-            const angle = eclipseShadowAngle(when, latDeg, lngDeg, st, moonPos, illum);
+            const angle = eclipseShadowAngle(when, latDeg, lngDeg, st, moonPos, illum, frameDate);
             const pxPerDeg = 240 / st.rMoon;               // the disc is 240 units across
             const off = st.sigma * pxPerDeg;
             const a = angle / DEG;
@@ -2043,17 +2046,35 @@ else window.SunCalc = SunCalc;
         /* --------------------------- status line --------------------------- */
         const eclipseStatusEl = document.getElementById('eclipseStatus');
 
-        // Umbral magnitude the eclipse reaches at its greatest, from gamma alone.
-        function magnitudeAtGreatest(ev) {
-            const date = new Date(ev.t0);
+        // Earth's shadow radii and the Moon's own, in degrees, for one instant.
+        function shadowRadii(date) {
             const dMoon = SunCalc.getMoonPosition(date, 0, 0).distance;
             const dSun = solarElements(date).dist;
             const pMoon = Math.asin(R_EARTH_KM / dMoon) * DEG;
             const pSun = Math.asin(R_EARTH_KM / dSun) * DEG;
             const sunSemi = Math.asin(R_SUN_KM / dSun) * DEG;
             const rMoon = Math.asin(R_MOON_KM / dMoon) * DEG;
-            const rhoU = UMBRA_ENLARGE * (pMoon + pSun - sunSemi);
-            return (rhoU + rMoon - Math.abs(ev.gamma) * pMoon) / (2 * rMoon);
+            return {
+                pMoon: pMoon, rMoon: rMoon,
+                rhoU: UMBRA_ENLARGE * (pMoon + pSun - sunSemi),
+                rhoP: PENUMBRA_ENLARGE * (pMoon + pSun + sunSemi)
+            };
+        }
+
+        // Umbral magnitude the eclipse reaches at its greatest, from gamma alone.
+        function magnitudeAtGreatest(ev) {
+            const r = shadowRadii(new Date(ev.t0));
+            return (r.rhoU + r.rMoon - Math.abs(ev.gamma) * r.pMoon) / (2 * r.rMoon);
+        }
+
+        /*
+           Penumbral magnitude at greatest. At or below zero the Moon never
+           reaches the shadow at all, so the entry is not an event anywhere on
+           Earth - the catalogue carries a few that miss by a hair.
+        */
+        function penumbralMagnitudeAtGreatest(ev) {
+            const r = shadowRadii(new Date(ev.t0));
+            return (r.rhoP + r.rMoon - Math.abs(ev.gamma) * r.pMoon) / (2 * r.rMoon);
         }
 
         function eclipseKind(mag) {
@@ -2070,13 +2091,86 @@ else window.SunCalc = SunCalc;
             return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
         }
 
-        function nextEclipseAfter(afterMs, minMagnitude) {
+        /*
+           How the Moon rides, from where you are, across the whole eclipse: a
+           lunar eclipse is visible from an entire hemisphere, but only if the
+           Moon is above your horizon while it happens. Cached because the status
+           line refreshes every second and this samples the span.
+        */
+        const visibilityCache = new Map();
+        function eclipseVisibility(ev) {
+            const key = ev.t0 + '|' + observerPos.lat.toFixed(2) + '|' + observerPos.lng.toFixed(2);
+            if (visibilityCache.has(key)) return visibilityCache.get(key);
+            const first = eclipseFirstContact(ev);
+            const last = 2 * ev.t0 - first;              // the track is symmetric
+            const altAt = ms => SunCalc.getMoonPosition(new Date(ms),
+                observerPos.lat, observerPos.lng).altitude * DEG;
+            let maxAlt = altAt(last);
+            for (let t = first; t <= last; t += 10 * 60e3) maxAlt = Math.max(maxAlt, altAt(t));
+            const atGreatest = SunCalc.getMoonPosition(new Date(ev.t0), observerPos.lat, observerPos.lng);
+            const out = {
+                visible: maxAlt > 3,                     // 3° clears rooftops and haze
+                maxAlt: maxAlt,
+                altAtGreatest: atGreatest.altitude * DEG,
+                azAtGreatest: (atGreatest.azimuth * DEG + 180) % 360
+            };
+            visibilityCache.set(key, out);
+            return out;
+        }
+
+        function nextEclipseAfter(afterMs, minMagnitude, requireVisible) {
             const floor = minMagnitude === undefined ? -2 : minMagnitude;
             for (const e of eclipseEvents) {
-                if (e.t0 > afterMs && magnitudeAtGreatest(e) >= floor) return e;
+                if (e.t0 <= afterMs) continue;
+                if (magnitudeAtGreatest(e) < floor) continue;
+                if (penumbralMagnitudeAtGreatest(e) <= 0.02) continue;   // misses entirely
+                if (requireVisible && !eclipseVisibility(e).visible) continue;
+                return e;
             }
             return null;
         }
+
+        /*
+           Cloud for the coming eclipse, when it is near enough to forecast.
+           OpenWeather's free call reaches five days ahead; beyond that the page
+           says nothing about cloud rather than inventing it. The call is purely
+           optional - no key, no network or a refusal leaves the astronomy intact.
+        */
+        let eclipseForecast = { t0: null, cloud: null, state: 'idle', at: 0 };
+        async function requestEclipseForecast(ev) {
+            eclipseForecast = { t0: ev.t0, cloud: null, state: 'pending', at: Date.now() };
+            const target = eclipseFirstContact(ev);
+            if (target - Date.now() > 5 * 86400e3 || target - Date.now() < -6 * 3600e3) {
+                eclipseForecast.state = 'too-far';
+                return;
+            }
+            try {
+                const url = `https://api.openweathermap.org/data/2.5/forecast?lat=${observerPos.lat}` +
+                    `&lon=${observerPos.lng}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+                const res = await fetch(url);
+                if (!res.ok) { eclipseForecast.state = 'unavailable'; return; }
+                const data = await res.json();
+                if (!Array.isArray(data.list) || !data.list.length) {
+                    eclipseForecast.state = 'unavailable'; return;
+                }
+                let best = data.list[0], bestGap = Infinity;
+                for (const entry of data.list) {
+                    const gap = Math.abs(entry.dt * 1000 - target);
+                    if (gap < bestGap) { bestGap = gap; best = entry; }
+                }
+                eclipseForecast = {
+                    t0: ev.t0,
+                    cloud: best.clouds ? best.clouds.all : null,
+                    state: bestGap <= 3 * 3600e3 ? 'ok' : 'too-far',
+                    at: Date.now()
+                };
+            } catch (e) {
+                eclipseForecast.state = 'unavailable';
+            }
+        }
+
+        // What the location and weather calls came back with, kept for the line.
+        let observerWeather = { cloud: null, city: null, country: null, state: 'unknown' };
 
         /*
            First contact (P1): the instant the Moon's limb first reaches the
@@ -2102,13 +2196,20 @@ else window.SunCalc = SunCalc;
             return ev.t0 - half * 3600e3;
         }
 
-        // The next eclipse of any kind; re-looked-up once it has begun.
+        /*
+           The next eclipse you could actually watch: one the Moon is above the
+           horizon for. If none in the table ever clears your horizon, fall back
+           to the next real eclipse anywhere rather than showing nothing - the
+           line then says it is not visible from here. Re-looked-up once it has
+           begun, and whenever the observer moves.
+        */
         let nextEclipseCache = null;
         function nextEclipse() {
             const now = Date.now();
             if (!nextEclipseCache || nextEclipseCache.start <= now) {
-                const ev = nextEclipseAfter(now);
+                const ev = nextEclipseAfter(now, undefined, true) || nextEclipseAfter(now);
                 nextEclipseCache = ev ? { ev: ev, start: eclipseFirstContact(ev) } : null;
+                if (ev) requestEclipseForecast(ev);
             }
             return nextEclipseCache;
         }
@@ -2136,32 +2237,47 @@ else window.SunCalc = SunCalc;
             }
             const st = eclipseAt(new Date(), observerPos.lat, observerPos.lng);
             if (st) {
+                const moonAlt = SunCalc.getMoonPosition(new Date(), observerPos.lat, observerPos.lng).altitude * DEG;
+                const sky = moonAlt <= 0
+                    ? ' · below your horizon'
+                    : ' · Moon ' + Math.round(moonAlt) + '° up' +
+                      (typeof observerWeather.cloud === 'number'
+                          ? ' · cloud ' + observerWeather.cloud + '%' : '');
                 eclipseStatusEl.className = 'active';
                 if (st.umbMag >= 1) {
-                    eclipseStatusEl.textContent = "🌍 Total lunar eclipse · the whole Moon is inside Earth's umbra";
+                    eclipseStatusEl.textContent = "🌍 Total lunar eclipse · the whole Moon is inside Earth's umbra" + sky;
                 } else if (st.umbMag > 0) {
                     eclipseStatusEl.textContent = '🌍 Partial lunar eclipse · ' +
                         (st.obscuration < 0.005
                             ? "the umbra is only just touching the disc"
-                            : Math.round(st.obscuration * 100) + "% of the disc is inside Earth's umbra");
+                            : Math.round(st.obscuration * 100) + "% of the disc is inside Earth's umbra") + sky;
                 } else {
-                    eclipseStatusEl.textContent = '🌍 Penumbral lunar eclipse · soft shading, no dark bite';
+                    eclipseStatusEl.textContent = '🌍 Penumbral lunar eclipse · soft shading, no dark bite' + sky;
                 }
                 return;
             }
             const next = nextEclipse();
             eclipseStatusEl.className = '';
-            eclipseStatusEl.textContent = next
-                ? '🌍 Next ' + eclipseKind(magnitudeAtGreatest(next.ev)) + ' lunar eclipse · ' +
-                  formatEclipseDate(next.start) + ' ' + formatEclipseClock(next.start) +
-                  ' · in ' + formatCountdown(next.start)
-                : '';
+            if (!next) { eclipseStatusEl.textContent = ''; return; }
+            const vis = eclipseVisibility(next.ev);
+            let note;
+            if (!vis.visible) {
+                note = ' · not visible from your location (Moon stays below the horizon)';
+            } else {
+                note = ' · Moon up to ' + Math.round(vis.maxAlt) + '°';
+                if (eclipseForecast.t0 === next.ev.t0 && typeof eclipseForecast.cloud === 'number') {
+                    note += ' · ' + eclipseForecast.cloud + '% cloud (forecast)';
+                }
+            }
+            eclipseStatusEl.textContent = '🌍 Next ' + eclipseKind(magnitudeAtGreatest(next.ev)) +
+                ' lunar eclipse · ' + formatEclipseDate(next.start) + ' ' + formatEclipseClock(next.start) +
+                ' · in ' + formatCountdown(next.start) + note;
         }
 
         /* --------------------------- preview mode --------------------------
            Eclipses are rare, so the page can also walk through the next one
            that actually shows a bite at a few hundred times real speed.       */
-        const previewState = { active: false, t: 0, lastT0: 0, speed: 420 };
+        const previewState = { active: false, t: 0, lastT0: 0, start: 0, speed: 420 };
         const PREVIEW_SPAN = 2.4 * 3600e3;         // either side of greatest eclipse
         let observerPos = { lat: 52.37, lng: 4.90 };
 
@@ -2189,21 +2305,41 @@ else window.SunCalc = SunCalc;
                 if (!ev) return;
                 previewState.active = true;
                 previewState.lastT0 = ev.t0;
-                previewState.t = ev.t0 - PREVIEW_SPAN;
+                // Open at first contact when it is a few hours away at most, so the
+                // walk-through covers the whole event and not just its middle.
+                const p1 = eclipseFirstContact(ev);
+                previewState.start = (ev.t0 - p1 < 6 * 3600e3) ? p1 : ev.t0 - PREVIEW_SPAN;
+                previewState.t = previewState.start;
                 btn.setAttribute('aria-pressed', 'true');
                 btn.textContent = '⏹ Exit preview';
             }
             refreshMoon();
         }
 
-        // Redraw the phase and the eclipse shadows for the current (or previewed) moment.
+        /*
+           Redraw the phase and the eclipse shadows for the current (or previewed)
+           moment. `when` pins one exact instant; otherwise the live clock is used,
+           or the preview's own clock while a preview is running.
+
+           A preview runs a few hundred times faster than life, and the Moon's
+           parallactic angle really does turn - about a degree a minute, which is
+           why the Moon appears to roll across the sky over a night. Played back at
+           speed that slow roll becomes a spin, and the craters appear to rotate
+           under the shadow. So while previewing, the sky is held still at greatest
+           eclipse and only the shadow moves: the face keeps its orientation, the
+           shadow crosses it in a straight line, which is what your eye reports
+           over the few minutes you would actually stand and watch. Live, nothing
+           is frozen - the frame is simply now.
+        */
         function refreshMoon(when) {
-            const date = when || (previewState.active ? new Date(previewState.t) : new Date());
-            const illum = SunCalc.getMoonIllumination(date);
-            const moonPos = SunCalc.getMoonPosition(date, observerPos.lat, observerPos.lng);
+            const previewing = previewState.active && !when;
+            const date = when || (previewing ? new Date(previewState.t) : new Date());
+            const frameDate = previewing ? new Date(previewState.lastT0) : date;
+            const illum = SunCalc.getMoonIllumination(frameDate);
+            const moonPos = SunCalc.getMoonPosition(frameDate, observerPos.lat, observerPos.lng);
             updateMoonVisual(illum.fraction, illum.phase,
                              (moonPos.parallacticAngle || 0) * DEG, illum.angle);
-            updateEclipseShadows(date, observerPos.lat, observerPos.lng, moonPos, illum);
+            updateEclipseShadows(date, observerPos.lat, observerPos.lng, moonPos, illum, frameDate);
             updateEclipseStatus();
         }
 
@@ -2314,65 +2450,67 @@ else window.SunCalc = SunCalc;
             return dirs[Math.round(azimuth / 22.5) % 16];
         }
 
+        /*
+           Sky conditions for a position, on its own. The page re-asks this when
+           you move and every few minutes, so the "will you see it" line is a
+           current reading rather than one taken once at load.
+        */
+        async function fetchCloud(lat, lon) {
+            const empty = { cloud: null, city: null, country: null, error: 'Weather data unavailable' };
+            try {
+                const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}` +
+                    `&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+                const res = await fetch(url);
+                if (!res.ok) return empty;
+                const data = await res.json();
+                return {
+                    cloud: (data.clouds && typeof data.clouds.all === 'number') ? data.clouds.all : null,
+                    city: data.name || null,
+                    country: (data.sys && data.sys.country) || '',
+                    error: null
+                };
+            } catch (e) {
+                return { cloud: null, city: null, country: null, error: 'Weather fetch failed' };
+            }
+        }
+
         async function fetchLocAndWeather() {
             return new Promise((resolve) => {
                 if (!navigator.geolocation) {
-                    resolve({ lat: 52.37, lon: 4.90, city: "Amsterdam", country: "NL", cloud: 100, error: "Geolocation not supported" });
+                    resolve({ lat: 52.37, lon: 4.90, city: "Amsterdam", country: "NL", cloud: null,
+                              error: "Geolocation not supported", fellBack: true });
                     return;
                 }
                 navigator.geolocation.getCurrentPosition(async (pos) => {
                     const lat = pos.coords.latitude;
                     const lon = pos.coords.longitude;
-                    let city = "Your Location", country = "", cloud = 100, error = null;
-                    try {
-                        const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=metric`;
-                        const res = await fetch(url);
-                        if (res.ok) {
-                            const data = await res.json();
-                            cloud = data.clouds?.all ?? 100;
-                            city = data.name || city;
-                            country = data.sys?.country || "";
-                        } else {
-                            error = "Weather data unavailable";
-                        }
-                    } catch (e) {
-                        error = "Weather fetch failed";
-                    }
-                    resolve({ lat, lon, city, country, cloud, error });
+                    const w = await fetchCloud(lat, lon);
+                    resolve({
+                        lat, lon,
+                        city: w.city || "Your Location",
+                        country: w.country || "",
+                        cloud: w.cloud, error: w.error, fellBack: false
+                    });
                 }, () => {
-                    resolve({ lat: 52.37, lon: 4.90, city: "Amsterdam", country: "NL", cloud: 100, error: "Geolocation denied / failed" });
+                    resolve({ lat: 52.37, lon: 4.90, city: "Amsterdam", country: "NL", cloud: null,
+                              error: "Location permission not granted", fellBack: true });
                 }, { enableHighAccuracy: false, timeout: 6000, maximumAge: 300000 });
             });
         }
 
-        async function show() {
+        // The 📍 line, rebuilt from wherever the observer is right now.
+        function renderLocationLine() {
             const now = new Date();
-            const { lat, lon, city, country, cloud, error } = await fetchLocAndWeather();
-
-            const moonIllumination = SunCalc.getMoonIllumination(now);
-            const moonPos = SunCalc.getMoonPosition(now, lat, lon);
-
-            const illuminationFraction = moonIllumination.fraction;
-            const phase = moonIllumination.phase;
-            const parallacticAngle = (moonPos.parallacticAngle || 0) * 180 / Math.PI;
-            const moonAltitude = moonPos.altitude * 180 / Math.PI;
-            const moonAzimuth = (moonPos.azimuth * 180 / Math.PI + 180) % 360;
-
-            currentPhaseIndex = getPhaseIndex(illuminationFraction, phase);
-            isSpecialPhase = (currentPhaseIndex === 0 || currentPhaseIndex === 4);
-
-            observerPos = { lat: lat, lng: lon };
-            refreshMoon(now);   // phase + any eclipse shadow, for this exact moment
-
-            document.getElementById('phaseName').textContent = phases[currentPhaseIndex];
-            updatePoem();
-
-            // Visibility prediction
+            const illum = SunCalc.getMoonIllumination(now);
+            const pos = SunCalc.getMoonPosition(now, observerPos.lat, observerPos.lng);
+            const altitude = pos.altitude * DEG;
+            const azimuth = (pos.azimuth * DEG + 180) % 360;
+            const cloud = observerWeather.cloud;
             let visibilityMsg;
-            if (moonAltitude <= 0) {
+            if (altitude <= 0) {
                 visibilityMsg = "Not visible (below horizon)";
-            } else if (error) {
-                visibilityMsg = `Moon above horizon · ${error}`;
+            } else if (cloud === null) {
+                visibilityMsg = `Moon above horizon · ${observerWeather.error || "sky conditions unknown"}`;
             } else if (cloud < 30) {
                 visibilityMsg = `Likely visible (clear, cloud ${cloud}%)`;
             } else if (cloud < 60) {
@@ -2380,11 +2518,109 @@ else window.SunCalc = SunCalc;
             } else {
                 visibilityMsg = `Unlikely visible (cloud ${cloud}%)`;
             }
-
-            const compass = getCompassDirection(moonAzimuth);
-            const locStr = country ? `${city}, ${country}` : city;
+            const place = observerWeather.country
+                ? `${observerWeather.city}, ${observerWeather.country}`
+                : (observerWeather.city || "Locating…");
+            const locStr = place + (observerWeather.state === 'denied'
+                ? ' · default location, permission not granted' : '');
             document.getElementById('location').textContent =
-                `📍 ${locStr} · Illum ${(illuminationFraction*100).toFixed(0)}% · Az ${moonAzimuth.toFixed(0)}° ${compass} · Alt ${moonAltitude.toFixed(0)}° · ${visibilityMsg}`;
+                `📍 ${locStr} · Illum ${(illum.fraction * 100).toFixed(0)}% · Az ${azimuth.toFixed(0)}° ` +
+                `${getCompassDirection(azimuth)} · Alt ${altitude.toFixed(0)}° · ${visibilityMsg}`;
+        }
+
+        function mergeWeather(w) {
+            observerWeather = {
+                cloud: w.cloud,
+                city: w.city || observerWeather.city,
+                country: w.country || observerWeather.country,
+                error: w.error || null,
+                // A refused location stays refused even if a weather call lands.
+                state: observerWeather.state === 'denied' ? 'denied' : (w.error ? 'no-weather' : 'granted')
+            };
+        }
+
+        /*
+           Move the observer. The Moon's altitude, which eclipse is next and
+           whether you can see it all depend on it, so the caches are dropped
+           and the page is redrawn - but only on a real move, since a phone
+           reports a new fix every few seconds even when it is sitting still.
+        */
+        let positionApplied = false;
+        function applyPosition(lat, lon, weather) {
+            if (weather) mergeWeather(weather);
+            const moved = Math.abs(lat - observerPos.lat) + Math.abs(lon - observerPos.lng) > 0.02;
+            if (moved || !positionApplied) {
+                observerPos = { lat: lat, lng: lon };
+                nextEclipseCache = null;
+                visibilityCache.clear();
+                positionApplied = true;
+                refreshMoon();
+            }
+            renderLocationLine();
+        }
+
+        /*
+           Keep following the observer: a new fix when the device moves, fresh
+           sky conditions every few minutes, and an immediate catch-up when the
+           tab comes back rather than waiting for the next scheduled tick.
+        */
+        const WEATHER_REFRESH_MS = 10 * 60e3;
+        function startLiveUpdates() {
+            if (navigator.geolocation && navigator.geolocation.watchPosition) {
+                let busy = false;
+                navigator.geolocation.watchPosition(async pos => {
+                    if (busy) return;
+                    busy = true;
+                    try {
+                        const lat = pos.coords.latitude, lon = pos.coords.longitude;
+                        applyPosition(lat, lon, await fetchCloud(lat, lon));
+                    } finally { busy = false; }
+                }, () => {}, { enableHighAccuracy: false, timeout: 20000, maximumAge: 120000 });
+            }
+
+            setInterval(async () => {
+                if (document.hidden) return;      // a hidden tab catches up on return
+                mergeWeather(await fetchCloud(observerPos.lat, observerPos.lng));
+                renderLocationLine();
+                // A forecast only exists once the eclipse is inside five days.
+                const next = nextEclipseCache && nextEclipseCache.ev;
+                if (next && Date.now() - (eclipseForecast.at || 0) > 30 * 60e3) {
+                    requestEclipseForecast(next);
+                }
+            }, WEATHER_REFRESH_MS);
+
+            const catchUp = () => { refreshMoon(); renderLocationLine(); };
+            document.addEventListener('visibilitychange', () => { if (!document.hidden) catchUp(); });
+            window.addEventListener('focus', catchUp);
+            window.addEventListener('online', catchUp);
+        }
+
+        async function show() {
+            const now = new Date();
+            const { lat, lon, city, country, cloud, error, fellBack } = await fetchLocAndWeather();
+
+            const moonIllumination = SunCalc.getMoonIllumination(now);
+            const moonPos = SunCalc.getMoonPosition(now, lat, lon);
+
+            const illuminationFraction = moonIllumination.fraction;
+            const phase = moonIllumination.phase;
+
+            currentPhaseIndex = getPhaseIndex(illuminationFraction, phase);
+            isSpecialPhase = (currentPhaseIndex === 0 || currentPhaseIndex === 4);
+
+            observerPos = { lat: lat, lng: lon };
+            observerWeather = { cloud: cloud, city: city, country: country, error: error,
+                                state: fellBack ? 'denied' : (error ? 'no-weather' : 'granted') };
+            nextEclipseCache = null;      // the answer depends on where you are
+            visibilityCache.clear();
+            positionApplied = true;
+            refreshMoon(now);   // phase + any eclipse shadow, for this exact moment
+            renderLocationLine();
+
+            document.getElementById('phaseName').textContent = phases[currentPhaseIndex];
+            updatePoem();
+
+            startLiveUpdates();           // from here on, follow the observer
         }
 
         const localeLanguages = {
@@ -2436,13 +2672,14 @@ else window.SunCalc = SunCalc;
                 // Walk the clock through the eclipse, then loop back to first contact.
                 previewState.t += Math.min(now - lastFrameAt, 100) * previewState.speed;
                 if (previewState.t - previewState.lastT0 > PREVIEW_SPAN) {
-                    previewState.t = previewState.lastT0 - PREVIEW_SPAN;
+                    previewState.t = previewState.start;
                 }
                 if (now - lastEclipseCheck > 40) { lastEclipseCheck = now; refreshMoon(); }
             } else if (now - lastEclipseCheck > 20000) {
                 // Between eclipses nothing moves fast; 20 s keeps the status honest.
                 lastEclipseCheck = now;
                 refreshMoon();
+                renderLocationLine();
             }
             lastFrameAt = now;
 
@@ -2544,5 +2781,5 @@ else window.SunCalc = SunCalc;
             setInterval(updateEclipseStatus, 1000);   // keeps the countdown ticking
         });
     </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a324e000b8277752',t:'MTc4NzkzNjQ1NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a325033b689c6709',t:'MTc4NzkzNzg5OA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

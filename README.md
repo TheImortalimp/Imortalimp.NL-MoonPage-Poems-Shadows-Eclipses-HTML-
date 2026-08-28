@@ -1,5 +1,3 @@
-# Imortalimp.NL-MoonPage-Poems-Shadows-Eclipses-HTML-
-MoonPage-Poems-Shadows-Eclipses (HTML)
 # 🌙 The Moon — live phase, 184 cultural moon poems, and Earth's shadow
 
 A single self-contained HTML page. It draws the real Moon phase as original SVG over a
@@ -282,10 +280,3 @@ edge while the umbral contacts stay sharp.
   Jean Meeus, NASA Goddard Space Flight Center — public domain,
   <https://eclipse.gsfc.nasa.gov/LEcat5/LE2001-2100.html>.
 - "Peace · HATE ALL HACKERS OF CODE · 2026"
-
-SunCalc by Vladimir Agafonkin, bundled in the page — BSD-2-Clause,
-https://github.com/mourner/suncalc.
-Eclipse data: Five Millennium Catalog of Lunar Eclipses, Fred Espenak and
-Jean Meeus, NASA Goddard Space Flight Center — public domain,
-https://eclipse.gsfc.nasa.gov/LEcat5/LE2001-2100.html.
-"Peace · HATE ALL HACKERS OF CODE · 2026"
